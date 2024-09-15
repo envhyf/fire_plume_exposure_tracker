@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+
+    <title>Punjab Fire Exposure Tracker</title>
+
+    <!-- Bootstrap CSS -->
+    <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.1.0/css/bootstrap.min.css" integrity="sha384-9gVQ4dYFwwWSjIDZnLEWnxCjeSWFphJiwGPXr1jddIhOegiu1FwO5qRGvFXOdJZ4" crossorigin="anonymous">
+
+    <!-- MapLibre GL JS -->
+    <script src='https://unpkg.com/maplibre-gl@4.7.0/dist/maplibre-gl.js'></script>
+    <link href='https://unpkg.com/maplibre-gl@4.7.0/dist/maplibre-gl.css' rel='stylesheet' />
+
+    <style>
+        html, body {
+            height: 100%;
+            margin: 0;
+            padding: 0;
+        }
+        #map {
+            position: absolute;
+            top: 0;
+            bottom: 0;
+            width: 100%;
+        }
+
+        .left-panel {
+            position: relative;
+            z-index: 1;
+            width: 30%;
+            background-color: #f8f9fa;
+            height: 100vh;
+            padding: 20px;
+            overflow-y: auto;
+        }
+        .main-container {
+            display: flex;
+            height: 100vh;
+            overflow: hidden;
+        }
+        .right-panel {
+            position: relative;
+            width: 70%;
+            height: 100vh;
+        }
+
+        /* Legend styles */
+        .legend {
+            background: white;
+            padding: 10px;
+            font-size: 12px;
+            box-shadow: 0 0 10px rgba(0, 0, 0, 0.2);
+        }
+        .legend div {
+            margin-bottom: 5px;
+        }
+        .legend-color {
+            display: inline-block;
+            width: 15px;
+            height: 15px;
+            margin-right: 5px;
+        }
+    </style>
+</head>
+<body>
+<div class="main-container">
+    <div class="left-panel">
+        <h4>Punjab Fire Exposure Tracker</h4>
+        <p>Yufang Hao</p>
+        <p>Paul Scherrer Institute</p>
+
+        <p>Select a date to view :</p>
+        <select id="dateSelector" class="form-control"></select>
+        <p></p>
+
+        <!-- Legend for PM2.5 levels -->
+        <div class="legend">
+            <h5>PM2.5 Levels (µg/m3)</h5>
+            <div><span class="legend-color" style="background: greenyellow;"></span>Low (0-100)</div>
+            <div><span class="legend-color" style="background: steelblue;"></span>Medium (100-200)</div>
+            <div><span class="legend-color" style="background: purple;"></span>High (>200)</div>
+        </div>
+    </div>
+
+    <!-- Right Panel: Contains the map -->
+    <div class="right-panel">
+        <div id="map"></div>
+    </div>
+</div>
+
+<!-- MapLibre GL JS -->
+<script src="https://unpkg.com/maplibre-gl@1.15.2/dist/maplibre-gl.js"></script>
+
+<script>
+    let fireSpotsData, siteData, heatmapData;
+    let currentLayer = null;
+
+    // Initialize the map
+    const map = new maplibregl.Map({
+        container: 'map', // Map container
+        style: 'https://basemaps.cartocdn.com/gl/positron-gl-style/style.json', // Carto Positron map style
+        center: [74.2137, 31.2276], // Starting position [longitude, latitude]
+        zoom: 5 // Initial zoom level
+    });
+
+    // Add navigation controls (zoom in/out)
+    map.addControl(new maplibregl.NavigationControl());
+
+    // Load the custom fire icon
+    map.on('load', function () {
+        map.loadImage('./data/fire_emoj.png', function (error, image) {
+            if (error) throw error;
+
+            // Add the fire emoji image to the map
+            map.addImage('fire-icon', image);
+
+            // Fetch and process the fire spots and PM2.5 data
+            fetchFireSpots();
+            fetchPM25Data();
+        });
+    });
+
+    // Fetch fire spots data
+    function fetchFireSpots() {
+        fetch('./data/4_prov_selected_date_fire_spots.geojson')
+            .then(response => response.json())
+            .then(data => {
+                fireSpotsData = data;
+                console.log("Fire Spots Data:", fireSpotsData); // Debugging
+
+                // Populate the date dropdown with unique sorted dates from fire spots
+                const dates = [...new Set(fireSpotsData.features.map(f => f.properties.date))].sort();
+                const dateSelector = document.getElementById('dateSelector');
+                dates.forEach(date => {
+                    const option = document.createElement('option');
+                    option.value = date;
+                    option.text = date;
+                    dateSelector.appendChild(option);
+                });
+
+                // Display the map for the first date by default
+                updateMap(dates[0]);
+
+                // Add event listener for date selection
+                dateSelector.addEventListener('change', function () {
+                    updateMap(this.value);
+                });
+            })
+            .catch(error => console.error('Error fetching fire spots data:', error));
+    }
+
+    // Fetch PM2.5 site data
+    function fetchPM25Data() {
+        fetch('./data/combined_sites_daily_pm2.5.geojson')
+            .then(response => response.json())
+            .then(data => {
+                siteData = data;
+                console.log("PM2.5 Site Data:", siteData); // Debugging
+            })
+            .catch(error => console.error('Error fetching PM2.5 data:', error));
+    }
+
+    // Function to update the map based on the selected date
+    function updateMap(selectedDate) {
+        // Remove any existing fire spots, heatmap, and PM2.5 layers
+        if (map.getLayer('fire-spots-layer')) {
+            map.removeLayer('fire-spots-layer');
+            map.removeSource('firespots');
+        }
+        if (map.getLayer('heatmap-layer')) {
+            map.removeLayer('heatmap-layer');
+            map.removeSource('heatmap-source');
+        }
+        if (currentLayer) {
+            map.removeLayer('site-layer');
+            map.removeSource('site-data-source');
+        }
+
+        // Display filtered fire spots for the selected date
+        const filteredFireSpots = {
+            "type": "FeatureCollection",
+            "features": fireSpotsData.features.filter(f => f.properties.date === selectedDate)
+        };
+
+        map.addSource('firespots', {
+            'type': 'geojson',
+            'data': filteredFireSpots
+        });
+
+        map.addLayer({
+            'id': 'fire-spots-layer',
+            'type': 'symbol',
+            'source': 'firespots',
+            'layout': {
+                'icon-image': 'fire-icon',
+                'icon-size': 0.1,
+                'icon-allow-overlap': true
+            }
+        });
+
+        // Fetch and display heatmap for the selected date
+        fetch('./data/November_2023_Punjab_fire_forward_3day.geojson')
+            .then(response => response.json())
+            .then(data => {
+                heatmapData = data;
+                const filteredHeatmap = {
+                    "type": "FeatureCollection",
+                    "features": heatmapData.features.map(f => ({
+                        ...f,
+                        "properties": {
+                            ...f.properties,
+                            "conc": f.properties.sum_conc[selectedDate]
+                        }
+                    })).filter(f => f.properties.conc !== undefined)
+                };
+
+                if (filteredHeatmap.features.length > 0) {
+                    map.addSource('heatmap-source', {
+                        'type': 'geojson',
+                        'data': filteredHeatmap
+                    });
+
+                    map.addLayer({
+                        'id': 'heatmap-layer',
+                        'type': 'heatmap',
+                        'source': 'heatmap-source',
+                        'maxzoom': 9,
+                        'paint': {
+                            'heatmap-weight': [
+                                'interpolate',
+                                ['linear'],
+                                ['get', 'conc'],
+                                0., 0,
+                                100, 0.2,
+                                500, 0.4,
+                                3000, 1
+                            ],
+                            'heatmap-intensity': [
+                                'interpolate',
+                                ['linear'],
+                                ['zoom'],
+                                0, 1,
+                                9, 3
+                            ],
+                            'heatmap-opacity': [
+                                'interpolate',
+                                ['linear'],
+                                ['zoom'],
+                                5, 0.8,
+                                9, 0.8
+                            ],
+                            'heatmap-color': [
+                                'interpolate',
+                                ['linear'],
+                                ['heatmap-density'],
+                                0, 'rgba(33,102,172,0)',
+                                0.1, 'rgba(205, 236, 251, 1)',
+                                0.2, 'rgba(152, 214, 245, 1)',
+                                0.3, 'rgba(249, 208, 82, 1)',
+                                0.4, 'rgba(72, 146, 188, 1)',
+                                0.5, 'rgba(72, 164, 129, 1)',
+                                0.6, 'rgba(102, 189, 74, 1)',
+                                0.7, 'rgba(193, 215, 85, 1)',
+                                0.8, 'rgba(249, 208, 82, 1)',
+                                0.91, 'rgba(246, 143, 56, 1)',
+                                1, 'rgba(140, 35, 204, 1)'
+                            ],
+                            'heatmap-radius': [
+                                'interpolate',
+                                ['linear'],
+                                ['zoom'],
+                                0, 2,
+                                9, 20
+                            ]
+                        }
+                    }, 'fire-spots-layer'); // Ensures heatmap is below fire spots
+                }
+            })
+            .catch(error => console.error('Error fetching heatmap data:', error));
+
+        // Filter and display PM2.5 site data for the selected date
+        const filteredPM25 = JSON.parse(JSON.stringify(siteData)); // Clone the data to avoid mutation
+
+        filteredPM25.features.forEach(feature => {
+            const pm25Value = feature.properties['PM2.5'][selectedDate];
+            feature.properties['concentration'] = pm25Value; // Set concentration for coloring
+        });
+
+        map.addSource('site-data-source', {
+            'type': 'geojson',
+            'data': filteredPM25
+        });
+
+        map.addLayer({
+            'id': 'site-layer',
+            'type': 'circle',
+            'source': 'site-data-source',
+            'paint': {
+                'circle-radius': 6,
+                'circle-color': [
+                    'interpolate',
+                    ['linear'],
+                    ['get', 'concentration'],
+                    0, 'greenyellow',   // Low concentration
+                    100, 'steelblue',  // Medium concentration
+                    200, 'purple'     // High concentration
+                ]
+            }
+        });
+
+        // Track the current layer for PM2.5 updates
+        currentLayer = 'site-layer';
+
+        // Add click event listener for showing PM2.5 popups
+        map.on('click', 'site-layer', function(e) {
+                const coordinates = e.features[0].geometry.coordinates.slice();
+                const properties = e.features[0].properties;
+
+                // Ensure the selected date is in the "YYYY-MM-DD" format
+                const selectedDate = new Date(dateSelector.value).toISOString().slice(0, 10);
+
+                   // Ensure 'PM2.5' is an object (dictionary)
+                if (typeof properties['PM2.5'] === 'string') {
+                    // If it's a string, try to parse it into an object
+                    try {
+                        properties['PM2.5'] = JSON.parse(properties['PM2.5']);
+                    } catch (error) {
+                        console.error('Error parsing PM2.5 data:', error);
+                    }
+                }
+
+                // Get PM2.5 concentration for the clicked site and selected date
+                const pm25Value = properties['PM2.5'][selectedDate];
+                            // Create the popup content
+                const popupContent = `
+                    Site: ${properties.site}<br>
+                    State: ${properties.state}<br>
+                    PM2.5: ${pm25Value.toFixed(2)} µg/m³
+                `;
+
+            new maplibregl.Popup()
+                .setLngLat(coordinates)
+                .setHTML(popupContent)
+                .addTo(map);
+        });
+
+            // Change the cursor to pointer when hovering over a site
+            map.on('mouseenter', 'site-layer', function() {
+                            map.getCanvas().style.cursor = 'pointer';
+                        });
+
+            // Change the cursor back when not hovering over a site
+            map.on('mouseleave', 'site-layer', function() {
+                map.getCanvas().style.cursor = '';
+            });
+
+    }
+</script>
+
+</body>
+</html>
